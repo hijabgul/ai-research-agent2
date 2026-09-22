@@ -33,7 +33,7 @@ def duckduckgo_search(query: str) -> str:
     # to read. 3 results with short snippets is usually enough context.
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
+            results = list(ddgs.text(query, max_results=2))
     except Exception as exc:  # network hiccups, rate limits, etc.
         return f"Search failed for query '{query}': {exc}"
 
@@ -44,7 +44,7 @@ def duckduckgo_search(query: str) -> str:
     for i, r in enumerate(results, start=1):
         title = r.get("title", "No title")
         link = r.get("href", "No link")
-        snippet = (r.get("body", "") or "")[:220]  # truncate long snippets
+        snippet = (r.get("body", "") or "")[:150]  # truncate long snippets
         formatted.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
 
     return "\n\n".join(formatted)
