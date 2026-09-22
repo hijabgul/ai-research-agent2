@@ -62,17 +62,16 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
 
     # CrewAI routes non-native providers (like Groq) through LiteLLM.
     # The model string format is "groq/<model-name>".
-    # openai/gpt-oss-120b is capped at only 8,000 tokens/minute on Groq's
-    # free tier, which is too tight for a multi-step agent (search + reason
-    # + write, several times over). llama-4-scout gets 30,000 TPM free —
-    # much more headroom — while still being a strong, fast, tool-capable
-    # model. Swap the model string below if you upgrade to a paid Groq tier
-    # and want gpt-oss-120b's specific style instead.
+    # openai/gpt-oss-120b is capped at 8,000 tokens/minute on Groq's free
+    # tier - as of writing, every current free-tier Groq chat model shares
+    # that same 8K TPM cap (Groq deprecated the higher-limit models like
+    # llama-4-scout and llama-3.3-70b in mid-2026). So we lean on keeping
+    # each run's token usage small instead of picking a roomier model.
     llm = LLM(
-        model="groq/meta-llama/llama-4-scout-17b-16e-instruct",
+        model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
         temperature=0.5,
-        max_tokens=1200,  # keeps completions smaller, easier on free-tier TPM limits
+        max_tokens=800,  # smaller completions, easier on the 8K TPM cap
     )
 
     researcher = Agent(
@@ -82,10 +81,8 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
             "produce a clear, well-organized, factual report."
         ),
         backstory=(
-            "You are an experienced research analyst who is excellent at "
-            "turning raw web search results into clear, well-structured "
-            "reports. You always search before writing, cross-check facts "
-            "across multiple results, and never make up sources."
+            "Experienced research analyst. Search before writing, keep "
+            "reports factual and well-organized, never invent sources."
         ),
         tools=[duckduckgo_search],
         llm=llm,
@@ -97,21 +94,21 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
         description=(
             f"Research the topic: '{topic}'.\n\n"
             "Steps to follow:\n"
-            "1. Use the DuckDuckGo Search tool at least 2-3 times with "
-            "different, specific search queries to gather up-to-date "
-            "information on the topic.\n"
-            "2. Cross-check facts that appear across multiple results.\n"
-            "3. Write a clear, well-organized report in Markdown format "
+            "1. Use the DuckDuckGo Search tool 1-2 times with focused, "
+            "specific queries to gather up-to-date information on the "
+            "topic. Don't over-search - stop once you have enough to write "
+            "a solid report.\n"
+            "2. Write a clear, well-organized report in Markdown format "
             "with:\n"
             "   - A short introduction to the topic\n"
-            "   - 3-5 key sections with headings covering the most "
+            "   - 2-4 key sections with headings covering the most "
             "important points\n"
             "   - A brief conclusion\n"
             "   - A final 'Sources' section listing the URLs you actually "
             "used\n"
         ),
         expected_output=(
-            "A well-structured Markdown report, roughly 400-700 words, "
+            "A well-structured Markdown report, roughly 300-500 words, "
             "with headings, a conclusion, and a 'Sources' section listing "
             "real URLs returned by the search tool."
         ),
