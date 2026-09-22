@@ -2,15 +2,12 @@
 General-purpose research agent.
 
 Sources tried in parallel (any topic works):
-  1. Google News RSS   -- fresh, current-events coverage (no API key)
+  1. Google News RSS   -- fresh current-events coverage (no API key)
   2. DuckDuckGo        -- general web search
-  3. Wikipedia REST    -- reliable structured background on the main subject
+  3. Wikipedia REST    -- reliable structured background
 
 Then 4 small Groq calls write the report:
   plan -> body -> tables -> conclusion
-
-No CrewAI. No tools. No "Tool choice is none" bug.
-Each call is small, so we stay under Groq's free-tier token cap.
 """
 
 import json
@@ -23,11 +20,7 @@ import xml.etree.ElementTree as ET
 import litellm
 
 
-# ---------------------------------------------------------------------------
-# Groq helper
-# ---------------------------------------------------------------------------
 def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
-    """Single Groq call via litellm -- no tools, no CrewAI loop."""
     for attempt in range(4):
         try:
             resp = litellm.completion(
@@ -53,10 +46,39 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Source 1: Google News RSS (fresh, no API key, works from any server)
+# Clean the topic before searching
+# ---------------------------------------------------------------------------
+def _clean_topic(topic: str) -> str:
+    """Strip instruction phrases so search gets a real query."""
+    t = topic.lower().strip().rstrip("?.")
+
+    prefixes = [
+        "write a detailed report on", "write a detailed report about",
+        "write a report on", "write a report about",
+        "write about", "give me a report on", "give me info about",
+        "tell me about", "research", "report on", "a report on",
+        "detailed report on", "comprehensive report on",
+        "please write", "please create", "please generate",
+    ]
+    for p in prefixes:
+        if t.startswith(p):
+            t = t[len(p):].strip()
+
+    suffixes = [
+        "write a detailed report", "write a report", "write report",
+        "detailed report", "in detail", "please", "thanks",
+    ]
+    for s in suffixes:
+        if t.endswith(s):
+            t = t[:-len(s)].strip()
+
+    return " ".join(t.split()) or topic
+
+
+# ---------------------------------------------------------------------------
+# Source 1: Google News RSS
 # ---------------------------------------------------------------------------
 def _google_news(topic: str, max_items: int = 6) -> str:
-    """Pull recent news headlines about the topic from Google News RSS."""
     try:
         q = urllib.parse.quote(topic)
         url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
@@ -65,12 +87,9 @@ def _google_news(topic: str, max_items: int = 6) -> str:
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             xml_bytes = r.read()
-
         root = ET.fromstring(xml_bytes)
-        items = root.findall(".//item")[:max_items]
-
         lines = []
-        for it in items:
+        for it in root.findall(".//item")[:max_items]:
             title = (it.findtext("title") or "").strip()
             pub = (it.findtext("pubDate") or "").strip()
             link = (it.findtext("link") or "").strip()
@@ -99,7 +118,7 @@ def _duckduckgo(topic: str, max_items: int = 6) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Source 3: Wikipedia summary for the main subject
+# Source 3: Wikipedia
 # ---------------------------------------------------------------------------
 def _wikipedia_summary(title: str) -> str:
     url = (
@@ -112,29 +131,21 @@ def _wikipedia_summary(title: str) -> str:
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read().decode())
-        extract = data.get("extract", "").strip()
-        return extract
+        return data.get("extract", "").strip()
     except Exception:
         return ""
 
 
 def _best_wikipedia_title(topic: str) -> str:
-    """
-    Pick a likely Wikipedia title from the topic.
-    e.g. "the prime ministers of pakistan from 1947 to 2026"
-       -> "List of prime ministers of Pakistan"
-    """
     t = topic.strip().rstrip("?.").lower()
-
-    # Common patterns -- convert to the corresponding "List of ..." page
-    m = re.search(r"(prime ministers?|presidents?|kings?|chief ministers?)\s+of\s+([a-z\s]+)", t)
+    m = re.search(
+        r"(prime ministers?|presidents?|kings?|chief ministers?)\s+of\s+([a-z\s]+)",
+        t,
+    )
     if m:
         role = m.group(1).strip().title()
         country = m.group(2).strip().title().split(" from ")[0].split(" to ")[0].strip()
         return f"List of {role.lower()} of {country}"
-
-    # Fallback: take the main noun phrase
-    # strip "the", leading articles, and years
     cleaned = re.sub(r"\b\d{4}\b", "", t)
     cleaned = re.sub(r"\b(the|a|an|from|to|in|on|of)\b", " ", cleaned)
     cleaned = " ".join(cleaned.split())
@@ -142,10 +153,11 @@ def _best_wikipedia_title(topic: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gather facts from ALL three sources
+# Gather facts
 # ---------------------------------------------------------------------------
 def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """Run all three sources, then distill into bullet facts."""
+    topic = _clean_topic(topic)
+
     news = _google_news(topic)
     ddg = _duckduckgo(topic)
     wiki_title = _best_wikipedia_title(topic)
@@ -163,7 +175,6 @@ def _gather_facts(topic: str, groq_api_key: str) -> str:
 """.strip()
 
     if len(combined) < 200:
-        # Everything failed -- fall back to model knowledge
         return _groq_call(
             groq_api_key,
             "You are a knowledge extractor. Output only bullet facts.",
@@ -171,7 +182,7 @@ def _gather_facts(topic: str, groq_api_key: str) -> str:
 
 Produce 15 bullet facts about "{topic}". Each bullet: - <fact>
 
-If the topic requires post-2023 info, add a final bullet:
+If the topic requires post-2023 info, add:
 - NOTE: my knowledge may be outdated; verify recent facts independently.
 
 At the very end add:
@@ -179,7 +190,6 @@ SOURCES: (model knowledge -- live sources unavailable)""",
             max_tokens=900,
         )
 
-    # Distill into bullets, prioritizing news for recency
     return _groq_call(
         groq_api_key,
         "You extract facts from sources. Output ONLY bullet points.",
@@ -191,7 +201,7 @@ Extract 15-20 key facts as bullets.
 
 RULES:
 1. NEWS items are the FRESHEST -- prioritize them for current events.
-2. If news mentions a person holding an office TODAY, include that exact
+2. If news mentions a person holding an office TODAY, include that
    person and the date.
 3. Wikipedia gives background and history -- use it for earlier facts.
 4. NEVER invent. If a fact is not in the sources, don't write it.
@@ -207,11 +217,9 @@ SOURCES: <comma-separated URLs>""",
 
 
 # ---------------------------------------------------------------------------
-# Write the report
+# Write report
 # ---------------------------------------------------------------------------
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
-    """Write the report in 4 small, adaptive, non-truncating calls."""
-
     system = (
         "You are a thorough research report writer. Use the provided facts. "
         "Never invent sources. Always produce every requested section fully. "
@@ -219,15 +227,13 @@ def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
         "Prefer the freshest facts (Google News) over your own training data."
     )
 
-    # ---- Call 0: Choose adaptive section headings ----
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
         f"""Topic: "{topic}"
 
 Pick the BEST structure for a research report on this topic.
-Choose TWO table sections that genuinely fit -- don't force
-"Good/Bad Effects" if they don't fit.
+Choose TWO table sections that genuinely fit.
 
 Examples:
 - Pros/cons        -> "Good Effects" / "Bad Effects"
@@ -242,7 +248,7 @@ TABLE1_HEADING: <short heading>
 TABLE1_COLUMNS: <col1> | <col2> | <col3>
 TABLE2_HEADING: <short heading>
 TABLE2_COLUMNS: <col1> | <col2> | <col3>
-BODY_FOCUS: <one line describing the detailed section's focus>""",
+BODY_FOCUS: <one line>""",
         max_tokens=300,
     )
 
@@ -256,13 +262,12 @@ BODY_FOCUS: <one line describing the detailed section's focus>""",
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
-    # ---- Call 1: Introduction + Detailed body ----
     body = _groq_call(
         groq_api_key,
         system,
         f"""Topic: {topic}
 
-Facts gathered (Google News + DuckDuckGo + Wikipedia):
+Facts gathered (from Google News + DuckDuckGo + Wikipedia):
 {facts}
 
 Write ONLY these two sections in Markdown, no tables:
@@ -270,20 +275,17 @@ Write ONLY these two sections in Markdown, no tables:
 ## 1. Introduction
 (2 paragraphs. If the facts reveal a CURRENT state -- e.g. a current
 office-holder, current status, latest event -- state it explicitly in
-the first paragraph with the date. If the facts do NOT reveal a
-current state, just introduce the topic historically instead.)
+the first paragraph with the date.)
 
 ## 4. Detailed Research Report
 (600-900 words focused on: {body_focus}. Use subsections.)
 
-Do NOT invent facts that aren't in the source material. If the sources
-do not cover a specific year, do not fabricate events for it.
+Do NOT invent facts that aren't in the source material.
 
 Output ONLY these two sections. Do NOT call tools.""",
         max_tokens=1500,
     )
 
-    # ---- Call 2: Two adaptive tables with REAL data ----
     tables = _groq_call(
         groq_api_key,
         system,
@@ -298,35 +300,33 @@ Produce EXACTLY these two Markdown tables and NOTHING else.
 
 | {t1_cols} |
 |---|---|
-| <real row 1> |
-| <real row 2> |
-| <real row 3> |
-| <real row 4> |
-| <real row 5> |
-| <real row 6> |
+| row 1 | ... | ... |
+| row 2 | ... | ... |
+| row 3 | ... | ... |
+| row 4 | ... | ... |
+| row 5 | ... | ... |
+| row 6 | ... | ... |
 
 ## 3. {t2_head}
 
 | {t2_cols} |
 |---|---|
-| <real row 1> |
-| <real row 2> |
-| <real row 3> |
-| <real row 4> |
-| <real row 5> |
-| <real row 6> |
+| row 1 | ... | ... |
+| row 2 | ... | ... |
+| row 3 | ... | ... |
+| row 4 | ... | ... |
+| row 5 | ... | ... |
+| row 6 | ... | ... |
 
 RULES:
 - Every cell must contain REAL data from the facts above.
-- NEVER write "...", "N/A", "Example", "<real row>", or leave blank.
-- At least 6 rows per table. More is fine.
-- Fill every row with facts you can actually see above.
+- NEVER write "...", "N/A", "Example", or leave cells blank.
+- At least 6 rows per table.
 
 Do NOT call tools.""",
         max_tokens=1500,
     )
 
-    # ---- Call 3: Conclusion + Sources ----
     ending = _groq_call(
         groq_api_key,
         system,
@@ -338,11 +338,10 @@ Facts gathered:
 Write ONLY these two sections:
 
 ## 5. Conclusion
-(1-2 paragraphs. Summarize the key findings and, if the facts reveal
-a current state, end by stating it clearly.)
+(1-2 paragraphs.)
 
 ## 6. Sources
-Bullet list of the URLs that appear in the facts above.
+Bullet list of URLs from the facts above.
 
 Do NOT call tools.""",
         max_tokens=800,
@@ -356,13 +355,8 @@ Do NOT call tools.""",
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
-    """Research any topic and return a COMPLETE report."""
     last_error: Exception | None = None
-
     for attempt in range(1, max_retries + 1):
         try:
             facts = _gather_facts(topic, groq_api_key)
@@ -380,5 +374,4 @@ def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
                 time.sleep(wait)
                 continue
             raise
-
     raise last_error  # pragma: no cover
