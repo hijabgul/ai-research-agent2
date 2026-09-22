@@ -1,6 +1,4 @@
 streamlit
-crewai
-crewai-tools
 litellm
 ddgs
 markdown
