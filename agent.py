@@ -2,16 +2,20 @@
 Research agent that produces a COMPLETE, topic-adaptive report.
 
 Architecture:
-  Phase 1: Search the web via ddgs (no CrewAI -> no tool-call bug).
+  Phase 1: Search the web via ddgs (with hard timeout -- no hanging).
   Phase 2: Direct Groq calls write the report in 4 small, adaptive chunks.
 """
 
+import concurrent.futures
 import re
 import time
 
 import litellm
 
 
+# ---------------------------------------------------------------------------
+# Groq helper
+# ---------------------------------------------------------------------------
 def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
     """Single Groq call via litellm -- no tools, no CrewAI loop."""
     for attempt in range(4):
@@ -25,35 +29,60 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
                 ],
                 temperature=0.4,
                 max_tokens=max_tokens,
+                timeout=60,  # hard cap per request
             )
             return resp.choices[0].message.content or ""
         except Exception as exc:
             msg = str(exc)
+            print(f"[groq] error: {msg[:200]}", flush=True)
             if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < 3:
                 m = re.search(r"try again in ([\d.]+)s", msg)
                 wait = (float(m.group(1)) + 5.0) if m else 20.0
+                print(f"[groq] rate limited, sleeping {wait}s", flush=True)
                 time.sleep(wait)
                 continue
             raise
     return ""
 
 
-def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """Search the web via ddgs and distill into bullets."""
-    raw = ""
-    try:
+# ---------------------------------------------------------------------------
+# DuckDuckGo with a hard timeout
+# ---------------------------------------------------------------------------
+def _ddg_with_timeout(topic: str, timeout: int = 15) -> str:
+    """Run DuckDuckGo search with a hard timeout so nothing hangs."""
+    def _do_search():
         from ddgs import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(f"{topic} facts", max_results=6))
-        raw = "\n".join(
+        return "\n".join(
             f"- {r.get('title', '')}: {r.get('body', '')} [{r.get('href', '')}]"
             for r in results
             if r.get("body")
         )
-    except Exception as exc:
-        raw = f"SEARCH_FAILED: {exc}"
 
-    if not raw or "SEARCH_FAILED" in raw or len(raw.strip()) < 100:
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_do_search)
+            return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        print(f"[gather] DDG timed out after {timeout}s", flush=True)
+        return "[DDG timed out]"
+    except Exception as exc:
+        print(f"[gather] DDG failed: {exc}", flush=True)
+        return f"[DDG failed: {exc}]"
+
+
+# ---------------------------------------------------------------------------
+# Gather facts
+# ---------------------------------------------------------------------------
+def _gather_facts(topic: str, groq_api_key: str) -> str:
+    """Search the web via ddgs (with timeout) and distill into bullets."""
+    print(f"[gather] searching for: {topic}", flush=True)
+    raw = _ddg_with_timeout(topic, timeout=15)
+    print(f"[gather] search returned {len(raw)} chars", flush=True)
+
+    if not raw or raw.startswith("[") or len(raw.strip()) < 100:
+        print("[gather] falling back to model knowledge", flush=True)
         return _groq_call(
             groq_api_key,
             "You are a knowledge extractor. Output only bullet facts.",
@@ -67,6 +96,7 @@ SOURCES: (model knowledge -- web search unavailable)""",
             max_tokens=800,
         )
 
+    print("[gather] distilling facts", flush=True)
     return _groq_call(
         groq_api_key,
         "You extract facts from search results. Return only bullet points.",
@@ -82,6 +112,9 @@ SOURCES: <comma-separated URLs found>""",
     )
 
 
+# ---------------------------------------------------------------------------
+# Write report
+# ---------------------------------------------------------------------------
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
     """Write the report in 4 small, adaptive, non-truncating calls."""
 
@@ -91,7 +124,7 @@ def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
         "Never stop early. Do NOT call any tools."
     )
 
-    # Call 0: Decide adaptive structure
+    print("[report] planning structure", flush=True)
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
@@ -126,7 +159,7 @@ BODY_FOCUS: <one line>""",
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
-    # Call 1: Introduction + Detailed body
+    print(f"[report] writing body (tables: {t1_head} / {t2_head})", flush=True)
     body = _groq_call(
         groq_api_key,
         system,
@@ -147,7 +180,7 @@ Output ONLY these two sections. Do NOT call tools.""",
         max_tokens=1500,
     )
 
-    # Call 2: The two adaptive tables
+    print("[report] writing tables", flush=True)
     tables = _groq_call(
         groq_api_key,
         system,
@@ -188,7 +221,7 @@ Do NOT call tools.""",
         max_tokens=1500,
     )
 
-    # Call 3: Conclusion + Sources
+    print("[report] writing ending", flush=True)
     ending = _groq_call(
         groq_api_key,
         system,
@@ -217,16 +250,24 @@ Do NOT call tools.""",
     )
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
     """Research a topic and return the COMPLETE report as a string."""
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
         try:
+            print(f"[run] attempt {attempt}: gathering facts...", flush=True)
             facts = _gather_facts(topic, groq_api_key)
+            print(f"[run] got {len(facts)} chars of facts", flush=True)
+            print("[run] writing report...", flush=True)
             report = _write_report(topic, facts, groq_api_key)
+            print(f"[run] done, report is {len(report)} chars", flush=True)
             return report
         except Exception as exc:
+            print(f"[run] error: {str(exc)[:300]}", flush=True)
             msg = str(exc)
             if (
                 ("rate_limit_exceeded" in msg or "Rate limit" in msg)
@@ -235,6 +276,7 @@ def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
                 last_error = exc
                 m = re.search(r"try again in ([\d.]+)s", msg)
                 wait = (float(m.group(1)) + 5.0) if m else 20.0
+                print(f"[run] rate limited, sleeping {wait}s", flush=True)
                 time.sleep(wait)
                 continue
             raise
