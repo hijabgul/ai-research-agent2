@@ -1,17 +1,27 @@
 """
-Builds and runs a single-agent CrewAI "crew" that researches a topic using
-free DuckDuckGo search and writes the findings up with Groq's
-openai/gpt-oss-120b model.
+Research agent that produces a COMPLETE report (with Good Effects and
+Bad Effects tables + a detailed research section) using CrewAI for the
+search phase and direct Groq calls for the writing phase.
 
-Tuned to produce a COMPLETE research report (with Good Effects table,
-Bad Effects table, and a detailed research section) while staying within
-Groq's free-tier 8,000 tokens/minute cap.
+Why the split?
+--------------
+CrewAI runs its agent in a think/act loop and truncates long final
+answers on its own. Bumping `max_tokens` alone does NOT fix that -- the
+loop itself cuts the report off mid-section. The reliable fix (used by
+many CrewAI + Groq demos) is:
+
+  1. Let CrewAI do ONLY the search + gather facts (short output).
+  2. Then make 2-3 direct Groq calls outside CrewAI to write the
+     report sections. Each call is small, so nothing truncates and
+     the whole thing stays under Groq's 8,000 tokens/minute cap.
 """
 
+import os
 import re
 import time
 
 import litellm
+from groq import Groq
 
 from crewai import Agent, Task, Crew, Process, LLM
 
@@ -19,20 +29,7 @@ from tools.duckduckgo_tool import duckduckgo_search
 
 
 def _patch_litellm_strip_cache_breakpoint() -> None:
-    """
-    Work around a current CrewAI bug: CrewAI tags messages internally with
-    a `cache_breakpoint` marker to support prompt caching. That marker is
-    supposed to be stripped before the request reaches non-native
-    providers, but for models routed through LiteLLM (which includes Groq)
-    that stripping step is currently missing, so Groq rejects the request
-    with "property 'cache_breakpoint' is unsupported".
-
-    Tracking issue: https://github.com/crewAIInc/crewAI/issues/6789
-    (fix written, not yet released as of this writing)
-
-    This patches litellm to strip the marker ourselves until CrewAI ships
-    an official fix. Safe to remove once that fix is released.
-    """
+    """Work around the CrewAI `cache_breakpoint` bug with LiteLLM/Groq."""
     if getattr(litellm, "_cache_breakpoint_patch_applied", False):
         return
 
@@ -61,118 +58,201 @@ def _patch_litellm_strip_cache_breakpoint() -> None:
 _patch_litellm_strip_cache_breakpoint()
 
 
-def build_crew(topic: str, groq_api_key: str) -> Crew:
-    """Create the single-agent crew for a given research topic."""
+# ---------------------------------------------------------------------------
+# PHASE 1 -- CrewAI gathers facts (short output, so no truncation)
+# ---------------------------------------------------------------------------
 
-    # openai/gpt-oss-120b is capped at 8,000 tokens/minute on Groq's free
-    # tier. That cap is a RATE limit (per minute), not a per-call output
-    # cap -- so a single, larger completion is fine as long as we don't
-    # spam the API in a tight loop. We give each completion enough room
-    # to finish the full report, and we keep the agent loop short so we
-    # don't blow the per-minute budget.
+def _gather_facts(topic: str, groq_api_key: str) -> str:
+    """Run the CrewAI agent to search and collect raw facts + URLs."""
     llm = LLM(
         model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
-        temperature=0.5,
-        max_tokens=4000,  # <-- raised from 600: allows a FULL report
+        temperature=0.3,
+        max_tokens=800,
     )
 
     researcher = Agent(
         role="Research Analyst",
-        goal=f"Research '{topic}' and write a complete, detailed report.",
-        backstory=(
-            "Thorough research analyst. Search first, cite real sources, "
-            "never invent facts. Always produce every section requested."
-        ),
+        goal=f"Search the web for facts about '{topic}'.",
+        backstory="Concise research analyst. Search first, return bullet facts with URLs.",
         tools=[duckduckgo_search],
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        max_iter=6,  # <-- raised from 4: gives room to search + write
+        max_iter=3,
     )
 
-    research_task = Task(
+    task = Task(
         description=(
-            f"Research the topic: '{topic}'.\n\n"
-            "1. Use the DuckDuckGo Search tool ONCE with a focused query "
-            "(twice only if the first search genuinely isn't enough).\n"
-            "2. Write a COMPLETE Markdown research report. You MUST include "
-            "ALL of the following sections in this exact order, and you "
-            "must NOT stop early:\n\n"
-            f"# Research Report: {topic}\n\n"
-            "## 1. Introduction\n"
-            "   - 2 paragraphs explaining the topic and why it matters.\n\n"
-            "## 2. Good Effects\n"
-            "   - A Markdown table with these exact columns:\n"
-            "     | Effect | Description | Real-world Example |\n"
-            "   - Provide AT LEAST 5 rows.\n\n"
-            "## 3. Bad Effects\n"
-            "   - A Markdown table with these exact columns:\n"
-            "     | Effect | Description | Real-world Example |\n"
-            "   - Provide AT LEAST 5 rows.\n\n"
-            "## 4. Detailed Research Report\n"
-            "   - 600-900 words covering: Background, Current Applications, "
-            "Challenges and Limitations, Future Outlook.\n\n"
-            "## 5. Conclusion\n"
-            "   - 1-2 paragraphs summarizing the findings.\n\n"
-            "## 6. Sources\n"
-            "   - A bullet list of the real URLs you used.\n\n"
-            "Do NOT stop before finishing ALL 6 sections. The tables in "
-            "sections 2 and 3 are mandatory."
+            f"Use the DuckDuckGo Search tool to research: '{topic}'.\n\n"
+            "Return ONLY a compact bullet list of facts and source URLs. "
+            "Do NOT write a report. Do NOT write paragraphs. "
+            "Format:\n"
+            "- fact one [url]\n"
+            "- fact two [url]\n"
+            "- fact three [url]\n"
+            "...\n"
+            "10-15 bullets maximum."
         ),
-        expected_output=(
-            "A full Markdown research report containing: an Introduction, "
-            "a Good Effects table (min 5 rows), a Bad Effects table "
-            "(min 5 rows), a 600-900 word Detailed Research section, a "
-            "Conclusion, and a Sources section with real URLs."
-        ),
+        expected_output="A short bullet list of facts with URLs. No prose.",
         agent=researcher,
     )
 
-    return Crew(
-        agents=[researcher],
-        tasks=[research_task],
-        process=Process.sequential,
-        verbose=True,
+    crew = Crew(agents=[researcher], tasks=[task], process=Process.sequential, verbose=True)
+    return str(crew.kickoff())
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 -- Direct Groq calls write the report (full length, no truncation)
+# ---------------------------------------------------------------------------
+
+def _groq_call(client: Groq, system: str, user: str, max_tokens: int) -> str:
+    """Single Groq chat completion with rate-limit retry."""
+    for attempt in range(4):
+        try:
+            resp = client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.5,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as exc:
+            msg = str(exc)
+            if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < 3:
+                m = re.search(r"try again in ([\d.]+)s", msg)
+                wait = (float(m.group(1)) + 5.0) if m else 20.0
+                time.sleep(wait)
+                continue
+            raise
+    return ""
+
+
+def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
+    """Write the full report in three small, non-truncating calls."""
+    client = Groq(api_key=groq_api_key)
+
+    system = (
+        "You are a thorough research report writer. Use the provided facts. "
+        "Never invent sources. Always produce every requested section fully. "
+        "Never stop early."
+    )
+
+    # ---- Call 1: Intro + Detailed body -----------------------------------
+    body = _groq_call(
+        client,
+        system,
+        f"""
+Topic: {topic}
+
+Facts gathered:
+{facts}
+
+Write the following two sections in Markdown. Do NOT include tables here.
+
+## 1. Introduction
+(2 paragraphs.)
+
+## 4. Detailed Research Report
+(600-900 words with subsections: Background, Current Applications,
+Challenges and Limitations, Future Outlook.)
+
+Output ONLY these two sections.
+""",
+        max_tokens=2000,
+    )
+
+    # ---- Call 2: Good + Bad effects tables -------------------------------
+    tables = _groq_call(
+        client,
+        system,
+        f"""
+Topic: {topic}
+
+Facts gathered:
+{facts}
+
+Produce EXACTLY these two Markdown tables. Nothing else -- no prose,
+no intro, no headings above the tables other than the ones shown.
+
+## 2. Good Effects
+
+| Effect | Description | Real-world Example |
+|---|---|---|
+| ... | ... | ... |
+
+(at least 6 rows)
+
+## 3. Bad Effects
+
+| Effect | Description | Real-world Example |
+|---|---|---|
+| ... | ... | ... |
+
+(at least 6 rows)
+""",
+        max_tokens=1500,
+    )
+
+    # ---- Call 3: Conclusion + Sources ------------------------------------
+    ending = _groq_call(
+        client,
+        system,
+        f"""
+Topic: {topic}
+
+Facts gathered:
+{facts}
+
+Write ONLY these two sections:
+
+## 5. Conclusion
+(1-2 paragraphs.)
+
+## 6. Sources
+(A bullet list of the URLs from the facts above.)
+""",
+        max_tokens=800,
+    )
+
+    # ---- Stitch in the required order ------------------------------------
+    return (
+        f"# Research Report: {topic}\n\n"
+        f"{body.strip()}\n\n"
+        f"{tables.strip()}\n\n"
+        f"{ending.strip()}\n"
     )
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    msg = str(exc)
-    return "rate_limit_exceeded" in msg or "Rate limit reached" in msg
-
-
-def _extract_retry_seconds(exc: Exception, default: float = 20.0) -> float:
-    """Groq tells us exactly how long to wait, e.g. '...in 10.4175s.'."""
-    match = re.search(r"try again in ([\d.]+)s", str(exc))
-    if match:
-        try:
-            return float(match.group(1)) + 5.0  # extra safety buffer
-        except ValueError:
-            pass
-    return default
-
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
     """
-    Run the crew for a topic and return the final report as a string.
+    Research a topic and return the COMPLETE report as a string.
 
-    Groq's free tier limits how many tokens per minute you can use. If we
-    hit that limit, wait for the time Groq tells us (plus a buffer) and
-    retry automatically instead of failing the whole report.
+    Phase 1: CrewAI searches and returns short bullet facts.
+    Phase 2: Three direct Groq calls write the report sections.
     """
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
-        crew = build_crew(topic, groq_api_key)
         try:
-            result = crew.kickoff()
-            return str(result)
+            facts = _gather_facts(topic, groq_api_key)
+            report = _write_report(topic, facts, groq_api_key)
+            return report
         except Exception as exc:
-            if _is_rate_limit_error(exc) and attempt < max_retries:
+            msg = str(exc)
+            if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < max_retries:
                 last_error = exc
-                time.sleep(_extract_retry_seconds(exc))
+                m = re.search(r"try again in ([\d.]+)s", msg)
+                wait = (float(m.group(1)) + 5.0) if m else 20.0
+                time.sleep(wait)
                 continue
             raise
 
-    raise last_error  # pragma: no cover - unreachable in practice
+    raise last_error  # pragma: no cover
