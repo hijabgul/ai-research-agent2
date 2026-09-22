@@ -2,13 +2,15 @@
 Research agent that produces a COMPLETE, topic-adaptive report.
 
 Architecture:
-  Phase 1: Search the web directly via ddgs (no CrewAI -> no tool-call bug).
-           Two searches: general + time-limited to past year (for recency).
+  Phase 1: Search the web via ddgs + Wikipedia REST API for fresh facts.
   Phase 2: Direct Groq calls write the report in 4 small, adaptive chunks.
 """
 
+import json
 import re
 import time
+import urllib.parse
+import urllib.request
 
 import litellm
 
@@ -39,78 +41,92 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
     return ""
 
 
+def _wikipedia_summary(title: str) -> str:
+    """Fetch a Wikipedia page summary as plain text."""
+    url = (
+        "https://en.wikipedia.org/api/rest_v1/page/summary/"
+        + urllib.parse.quote(title.replace(" ", "_"))
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        return data.get("extract", "")
+    except Exception:
+        return ""
+
+
 def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """
-    Gather facts. Two searches: general + time-limited to last year,
-    so we get CURRENT info and not stale Wikipedia text.
-    """
-    raw = ""
+    """Gather facts from DuckDuckGo + Wikipedia, prioritizing recent data."""
+    results_text = ""
+
+    # --- 1. DuckDuckGo general search ---
     try:
         from ddgs import DDGS
-
         with DDGS() as ddgs:
-            general = list(ddgs.text(topic, max_results=6))
-            try:
-                recent = list(
-                    ddgs.text(f"{topic} 2025 2026", max_results=5, timelimit="y")
-                )
-            except Exception:
-                recent = []
-
-        all_results = general + recent
-        raw = "\n".join(
-            f"- {r.get('title', '')}: {r.get('body', '')} [{r.get('href', '')}]"
-            for r in all_results
+            ddg = list(ddgs.text(topic, max_results=6))
+        results_text += "\n".join(
+            f"- {r.get('title','')}: {r.get('body','')} [{r.get('href','')}]"
+            for r in ddg
             if r.get("body")
         )
-    except Exception as exc:
-        raw = f"SEARCH_FAILED: {exc}"
+    except Exception as e:
+        results_text += f"\n[DDG failed: {e}]\n"
 
-    if not raw or "SEARCH_FAILED" in raw or len(raw.strip()) < 100:
+    # --- 2. Wikipedia summary for the main subject ---
+    subject = topic.split(" from ")[0].split(" of ")[-1].strip()
+    wiki_text = _wikipedia_summary(subject)
+    if wiki_text:
+        results_text += f"\n- WIKIPEDIA ({subject}): {wiki_text}"
+
+    # --- 3. Wikipedia "List of ..." page if applicable ---
+    list_candidates = [
+        "List of prime ministers of Pakistan",
+        "List of presidents of Pakistan",
+        "List of prime ministers of India",
+        "List of presidents of the United States",
+    ]
+    for cand in list_candidates:
+        if any(word.lower() in topic.lower() for word in cand.split()[1:4]):
+            list_text = _wikipedia_summary(cand)
+            if list_text:
+                results_text += f"\n- WIKIPEDIA LIST ({cand}): {list_text}"
+            break
+
+    # --- 4. If search yielded almost nothing, fall back to model knowledge ---
+    if not results_text.strip() or len(results_text.strip()) < 200:
         return _groq_call(
             groq_api_key,
             "You are a knowledge extractor. Output only bullet facts.",
-            f"""
-Web search for "{topic}" failed. Use your own knowledge.
+            f"""Web search for "{topic}" failed. Use your own knowledge.
 
 Produce 12-15 bullet facts about "{topic}". Each bullet:
 - <fact>
 
-IMPORTANT: Your training data has a cutoff around 2023. If the topic
-involves people or events after 2023, say clearly that the information
-may be outdated.
-
 At the end add this exact line:
-SOURCES: (model knowledge -- web search unavailable)
-""",
+SOURCES: (model knowledge -- web search unavailable)""",
             max_tokens=800,
         )
 
+    # --- 5. Distill everything into bullets ---
     return _groq_call(
         groq_api_key,
-        "You extract facts from search results. Return only bullet points.",
-        f"""
-Search results for "{topic}" (these are CURRENT, use them):
-{raw[:4000]}
+        "You extract facts from sources. Return only bullet points.",
+        f"""Sources about "{topic}":
 
-Extract 12-15 key facts as bullets.
+{results_text[:5000]}
+
+Extract 15-20 key facts as bullets.
 
 CRITICAL RULES:
-1. PREFER the search results above over your own memory.
-2. If a search result mentions a DATE in 2024, 2025, or 2026, include
-   that exact date and event -- these are the most important facts.
-3. If the search results contradict your training data, USE THE
-   SEARCH RESULTS.
-4. If the search results say nothing about 2024-2026, say so explicitly
-   in a bullet: "No 2024-2026 updates in search results."
-5. Include source URLs in brackets.
+1. PREFER these sources over your own memory.
+2. Include EVERY event mentioned in 2022, 2023, 2024, 2025, 2026.
+3. Note the year for each fact where mentioned.
+4. Include source URLs in brackets.
 
 Format: - fact one [url]
 
-At the end add a line:
-SOURCES: <comma-separated URLs found>
-""",
-        max_tokens=900,
+At the end add: SOURCES: <comma-separated URLs>""",
+        max_tokens=1000,
     )
 
 
@@ -121,16 +137,16 @@ def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
         "You are a thorough research report writer. Use the provided facts. "
         "Never invent sources. Always produce every requested section fully. "
         "Never stop early. Do NOT call any tools. "
-        "If the facts mention recent events (2024-2026), treat them as "
+        "If the facts mention recent events (2022-2026), treat them as "
         "authoritative -- do NOT substitute older information from your "
         "training data."
     )
 
+    # ---- Call 0: Decide report structure ----
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
-        f"""
-Topic: "{topic}"
+        f"""Topic: "{topic}"
 
 Decide the BEST structure for a research report on this topic.
 Pick TWO table sections that genuinely fit -- do NOT force
@@ -147,8 +163,7 @@ TABLE1_HEADING: <short heading>
 TABLE1_COLUMNS: <col1> | <col2> | <col3>
 TABLE2_HEADING: <short heading>
 TABLE2_COLUMNS: <col1> | <col2> | <col3>
-BODY_FOCUS: <one line describing what the detailed section should cover>
-""",
+BODY_FOCUS: <one line describing what the detailed section should cover>""",
         max_tokens=300,
     )
 
@@ -162,11 +177,11 @@ BODY_FOCUS: <one line describing what the detailed section should cover>
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
+    # ---- Call 1: Introduction + Detailed body ----
     body = _groq_call(
         groq_api_key,
         system,
-        f"""
-Topic: {topic}
+        f"""Topic: {topic}
 
 Facts gathered (CURRENT as of 2026 -- trust these over memory):
 {facts}
@@ -187,49 +202,58 @@ CRITICAL: Your training data ends around 2023. Do NOT present
 memory disagree, USE THE FACTS. If the facts do not cover a recent
 event, say so -- do NOT fill the gap from memory.
 
-Output ONLY these two sections. Do NOT call tools.
-""",
+Output ONLY these two sections. Do NOT call tools.""",
         max_tokens=1500,
     )
 
+    # ---- Call 2: The two adaptive tables (forced to have real data) ----
     tables = _groq_call(
         groq_api_key,
         system,
-        f"""
-Topic: {topic}
+        f"""Topic: {topic}
 
-Facts gathered (current, use these):
+Facts gathered:
 {facts}
 
-Produce EXACTLY these two Markdown tables and NOTHING else (no prose,
-no intro, no headings besides the ones shown).
+Produce EXACTLY these two Markdown tables and NOTHING else.
 
 ## 2. {t1_head}
 
 | {t1_cols} |
-|---|
-| ... |
-
-(at least 6 rows)
+|---|---|
+| row 1 | ... | ... |
+| row 2 | ... | ... |
+| row 3 | ... | ... |
+| row 4 | ... | ... |
+| row 5 | ... | ... |
+| row 6 | ... | ... |
 
 ## 3. {t2_head}
 
 | {t2_cols} |
-|---|
-| ... |
+|---|---|
+| row 1 | ... | ... |
+| row 2 | ... | ... |
+| row 3 | ... | ... |
+| row 4 | ... | ... |
+| row 5 | ... | ... |
+| row 6 | ... | ... |
 
-(at least 6 rows)
+RULES:
+- Every cell must contain REAL data from the facts above.
+- NEVER write "...", "N/A", "Example", or leave cells blank.
+- If you do not have enough data for a row, still fill it with what
+  you know from the facts.
 
-Do NOT call tools.
-""",
-        max_tokens=1200,
+Do NOT call tools.""",
+        max_tokens=1500,
     )
 
+    # ---- Call 3: Conclusion + Sources ----
     ending = _groq_call(
         groq_api_key,
         system,
-        f"""
-Topic: {topic}
+        f"""Topic: {topic}
 
 Facts gathered:
 {facts}
@@ -242,8 +266,7 @@ Write ONLY these two sections:
 ## 6. Sources
 If real URLs appear in the facts above, list them as bullets.
 If NOT, write exactly: "Model knowledge -- live web sources unavailable."
-Do NOT call tools.
-""",
+Do NOT call tools.""",
         max_tokens=700,
     )
 
