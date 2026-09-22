@@ -1,27 +1,21 @@
 """
 Research agent that produces a COMPLETE report (with Good Effects and
-Bad Effects tables + a detailed research section) using CrewAI for the
-search phase and direct Groq calls for the writing phase.
+Bad Effects tables + a detailed research section).
+
+Architecture:
+  Phase 1: CrewAI agent searches the web and returns raw facts.
+  Phase 2: Direct Groq calls (no tools) write the report in 3 small chunks.
 
 Why the split?
---------------
-CrewAI runs its agent in a think/act loop and truncates long final
-answers on its own. Bumping `max_tokens` alone does NOT fix that -- the
-loop itself cuts the report off mid-section. The reliable fix (used by
-many CrewAI + Groq demos) is:
-
-  1. Let CrewAI do ONLY the search + gather facts (short output).
-  2. Then make 2-3 direct Groq calls outside CrewAI to write the
-     report sections. Each call is small, so nothing truncates and
-     the whole thing stays under Groq's 8,000 tokens/minute cap.
+CrewAI + Groq's gpt-oss-120b has a known bug where tool calls fail with
+"Tool choice is none, but model called a tool". By keeping tool-use
+confined to the search phase, we bypass the bug entirely.
 """
 
-import os
 import re
 import time
 
 import litellm
-from groq import Groq
 
 from crewai import Agent, Task, Crew, Process, LLM
 
@@ -58,12 +52,8 @@ def _patch_litellm_strip_cache_breakpoint() -> None:
 _patch_litellm_strip_cache_breakpoint()
 
 
-# ---------------------------------------------------------------------------
-# PHASE 1 -- CrewAI gathers facts (short output, so no truncation)
-# ---------------------------------------------------------------------------
-
 def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """Run the CrewAI agent to search and collect raw facts + URLs."""
+    """Phase 1: CrewAI agent searches the web and returns raw facts."""
     llm = LLM(
         model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
@@ -79,7 +69,7 @@ def _gather_facts(topic: str, groq_api_key: str) -> str:
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        max_iter=3,
+        max_iter=5,
     )
 
     task = Task(
@@ -98,20 +88,22 @@ def _gather_facts(topic: str, groq_api_key: str) -> str:
         agent=researcher,
     )
 
-    crew = Crew(agents=[researcher], tasks=[task], process=Process.sequential, verbose=True)
+    crew = Crew(
+        agents=[researcher],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=True,
+    )
     return str(crew.kickoff())
 
 
-# ---------------------------------------------------------------------------
-# PHASE 2 -- Direct Groq calls write the report (full length, no truncation)
-# ---------------------------------------------------------------------------
-
-def _groq_call(client: Groq, system: str, user: str, max_tokens: int) -> str:
-    """Single Groq chat completion with rate-limit retry."""
+def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
+    """Single Groq call via litellm — no tools, no CrewAI loop."""
     for attempt in range(4):
         try:
-            resp = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
+            resp = litellm.completion(
+                model="groq/openai/gpt-oss-120b",
+                api_key=api_key,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -132,18 +124,16 @@ def _groq_call(client: Groq, system: str, user: str, max_tokens: int) -> str:
 
 
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
-    """Write the full report in three small, non-truncating calls."""
-    client = Groq(api_key=groq_api_key)
-
+    """Phase 2: Write the report in 3 small, non-truncating calls."""
     system = (
         "You are a thorough research report writer. Use the provided facts. "
         "Never invent sources. Always produce every requested section fully. "
         "Never stop early."
     )
 
-    # ---- Call 1: Intro + Detailed body -----------------------------------
+    # Call 1 — Introduction + Detailed body
     body = _groq_call(
-        client,
+        groq_api_key,
         system,
         f"""
 Topic: {topic}
@@ -165,9 +155,9 @@ Output ONLY these two sections.
         max_tokens=2000,
     )
 
-    # ---- Call 2: Good + Bad effects tables -------------------------------
+    # Call 2 — Good Effects + Bad Effects tables
     tables = _groq_call(
-        client,
+        groq_api_key,
         system,
         f"""
 Topic: {topic}
@@ -197,9 +187,9 @@ no intro, no headings above the tables other than the ones shown.
         max_tokens=1500,
     )
 
-    # ---- Call 3: Conclusion + Sources ------------------------------------
+    # Call 3 — Conclusion + Sources
     ending = _groq_call(
-        client,
+        groq_api_key,
         system,
         f"""
 Topic: {topic}
@@ -218,7 +208,7 @@ Write ONLY these two sections:
         max_tokens=800,
     )
 
-    # ---- Stitch in the required order ------------------------------------
+    # Stitch in the required order
     return (
         f"# Research Report: {topic}\n\n"
         f"{body.strip()}\n\n"
@@ -227,17 +217,8 @@ Write ONLY these two sections:
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
-    """
-    Research a topic and return the COMPLETE report as a string.
-
-    Phase 1: CrewAI searches and returns short bullet facts.
-    Phase 2: Three direct Groq calls write the report sections.
-    """
+    """Research a topic and return the COMPLETE report as a string."""
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
