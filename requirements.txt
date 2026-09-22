@@ -1,4 +1,6 @@
-crewai
-litellm
-ddgs
 streamlit
+crewai
+crewai-tools
+litellm
+duckduckgo-search
+groq
