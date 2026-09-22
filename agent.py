@@ -4,12 +4,6 @@ Research agent that produces a COMPLETE, topic-adaptive report.
 Architecture:
   Phase 1: Search the web directly via ddgs (no CrewAI -> no tool-call bug).
   Phase 2: Direct Groq calls write the report in 4 small, adaptive chunks.
-
-Why no CrewAI?
-CrewAI + Groq's gpt-oss-120b has a known bug where tool calls fail with
-"Tool choice is none, but model called a tool". By skipping CrewAI
-entirely for this flow, we sidestep the bug completely while still
-staying well under Groq's free-tier 8,000 tokens/minute cap.
 """
 
 import re
@@ -18,9 +12,6 @@ import time
 import litellm
 
 
-# ---------------------------------------------------------------------------
-# Groq call helper with retry
-# ---------------------------------------------------------------------------
 def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
     """Single Groq call via litellm -- no tools, no CrewAI loop."""
     for attempt in range(4):
@@ -32,7 +23,7 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=max_tokens,
             )
             return resp.choices[0].message.content or ""
@@ -47,20 +38,20 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: Search the web (via ddgs, with model-knowledge fallback)
-# ---------------------------------------------------------------------------
 def _gather_facts(topic: str, groq_api_key: str) -> str:
     """
-    Gather facts. Try ddgs search first; on failure, ask the model directly.
-    Never returns empty -- guarantees tables and sources get populated.
+    Gather facts. Search with a recency-weighted query so the model
+    gets CURRENT info, not its stale internal knowledge.
     """
     raw = ""
     try:
         from ddgs import DDGS
 
+        # Use a recency-friendly query. The word "latest" and "current"
+        # nudges ddgs to return fresh results.
+        query = f"{topic} latest current 2026"
         with DDGS() as ddgs:
-            results = list(ddgs.text(f"{topic} facts", max_results=6))
+            results = list(ddgs.text(query, max_results=8))
 
         raw = "\n".join(
             f"- {r.get('title', '')}: {r.get('body', '')} [{r.get('href', '')}]"
@@ -71,7 +62,6 @@ def _gather_facts(topic: str, groq_api_key: str) -> str:
         raw = f"SEARCH_FAILED: {exc}"
 
     if not raw or "SEARCH_FAILED" in raw or len(raw.strip()) < 100:
-        # Fallback: model knowledge, clearly labelled.
         return _groq_call(
             groq_api_key,
             "You are a knowledge extractor. Output only bullet facts.",
@@ -81,43 +71,56 @@ Web search for "{topic}" failed. Use your own knowledge.
 Produce 12-15 bullet facts about "{topic}". Each bullet:
 - <fact>
 
+IMPORTANT: Your training data has a cutoff. If the topic involves
+people or events after 2023, say clearly that the information may
+be outdated.
+
 At the end add this exact line:
 SOURCES: (model knowledge -- web search unavailable)
 """,
             max_tokens=800,
         )
 
-    # We got search results -- distill into bullets.
+    # Distill into bullets, explicitly telling the model to PREFER the
+    # search results over its own memory.
     return _groq_call(
         groq_api_key,
         "You extract facts from search results. Return only bullet points.",
         f"""
-Search results for "{topic}":
-{raw[:3000]}
+Search results for "{topic}" (these are CURRENT, use them):
+{raw[:3500]}
 
-Extract 12-15 key facts as bullets. Include any URLs you see in brackets.
+Extract 12-15 key facts as bullets.
+
+CRITICAL RULES:
+1. PREFER the search results above over your own memory.
+2. If the search results contradict your training data, USE THE
+   SEARCH RESULTS -- they are more recent.
+3. Include any URLs you see in brackets.
+4. If the search results mention a specific date or office-holder,
+   include that exact detail.
+
 Format: - fact one [url]
 
 At the end add a line:
 SOURCES: <comma-separated URLs found>
 """,
-        max_tokens=800,
+        max_tokens=900,
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: Write the report (no tools, no tool-choice error)
-# ---------------------------------------------------------------------------
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
     """Write the report in 4 small, adaptive, non-truncating calls."""
 
     system = (
         "You are a thorough research report writer. Use the provided facts. "
         "Never invent sources. Always produce every requested section fully. "
-        "Never stop early. Do NOT call any tools."
+        "Never stop early. Do NOT call any tools. "
+        "If the facts mention recent events (2024-2026), treat them as "
+        "authoritative -- do NOT substitute older information from your "
+        "training data."
     )
 
-    # ---- Call 0: Decide report structure for THIS topic -----------------
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
@@ -154,14 +157,13 @@ BODY_FOCUS: <one line describing what the detailed section should cover>
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
-    # ---- Call 1: Introduction + Detailed body ---------------------------
     body = _groq_call(
         groq_api_key,
         system,
         f"""
 Topic: {topic}
 
-Facts gathered:
+Facts gathered (current, use these):
 {facts}
 
 Write ONLY these two sections in Markdown, no tables:
@@ -172,19 +174,21 @@ Write ONLY these two sections in Markdown, no tables:
 ## 4. Detailed Research Report
 (600-900 words focused on: {body_focus}. Use subsections.)
 
+IMPORTANT: Where the facts mention recent people/events, use those.
+Do NOT revert to older information.
+
 Output ONLY these two sections. Do NOT call tools.
 """,
         max_tokens=1500,
     )
 
-    # ---- Call 2: The two adaptive tables --------------------------------
     tables = _groq_call(
         groq_api_key,
         system,
         f"""
 Topic: {topic}
 
-Facts gathered:
+Facts gathered (current, use these):
 {facts}
 
 Produce EXACTLY these two Markdown tables and NOTHING else (no prose,
@@ -211,7 +215,6 @@ Do NOT call tools.
         max_tokens=1200,
     )
 
-    # ---- Call 3: Conclusion + Sources -----------------------------------
     ending = _groq_call(
         groq_api_key,
         system,
@@ -242,9 +245,6 @@ Do NOT call tools.
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
     """Research a topic and return the COMPLETE report as a string."""
     last_error: Exception | None = None
