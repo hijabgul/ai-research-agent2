@@ -2,6 +2,13 @@
 Builds and runs a single-agent CrewAI "crew" that researches a topic using
 free DuckDuckGo search and writes the findings up with Groq's
 openai/gpt-oss-120b model.
+
+Tuned to stay well under Groq's free-tier 8,000 tokens/minute cap:
+- short backstory/task text (every word costs tokens on every call)
+- small search results (2 results, short snippets)
+- capped completion length
+- capped agent loop iterations (fewer LLM round-trips per run)
+- automatic retry with backoff if the rate limit is still hit
 """
 
 import re
@@ -60,57 +67,42 @@ _patch_litellm_strip_cache_breakpoint()
 def build_crew(topic: str, groq_api_key: str) -> Crew:
     """Create the single-agent crew for a given research topic."""
 
-    # CrewAI routes non-native providers (like Groq) through LiteLLM.
-    # The model string format is "groq/<model-name>".
     # openai/gpt-oss-120b is capped at 8,000 tokens/minute on Groq's free
-    # tier - as of writing, every current free-tier Groq chat model shares
-    # that same 8K TPM cap (Groq deprecated the higher-limit models like
-    # llama-4-scout and llama-3.3-70b in mid-2026). So we lean on keeping
-    # each run's token usage small instead of picking a roomier model.
+    # tier. Every current free-tier Groq chat model shares roughly that
+    # same cap, so the fix is to keep each run's token usage small rather
+    # than pick a roomier model.
     llm = LLM(
         model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
         temperature=0.5,
-        max_tokens=800,  # smaller completions, easier on the 8K TPM cap
+        max_tokens=600,  # caps how long each completion can be
     )
 
     researcher = Agent(
-        role="Senior Research Analyst",
-        goal=(
-            f"Research the topic '{topic}' thoroughly using web search, and "
-            "produce a clear, well-organized, factual report."
-        ),
-        backstory=(
-            "Experienced research analyst. Search before writing, keep "
-            "reports factual and well-organized, never invent sources."
-        ),
+        role="Research Analyst",
+        goal=f"Research '{topic}' and write a short, factual report.",
+        backstory="Concise research analyst. Search first, write briefly, never invent sources.",
         tools=[duckduckgo_search],
         llm=llm,
         verbose=True,
         allow_delegation=False,
+        max_iter=4,  # caps how many think/act loops the agent can take
     )
 
     research_task = Task(
         description=(
             f"Research the topic: '{topic}'.\n\n"
-            "Steps to follow:\n"
-            "1. Use the DuckDuckGo Search tool 1-2 times with focused, "
-            "specific queries to gather up-to-date information on the "
-            "topic. Don't over-search - stop once you have enough to write "
-            "a solid report.\n"
-            "2. Write a clear, well-organized report in Markdown format "
-            "with:\n"
-            "   - A short introduction to the topic\n"
-            "   - 2-4 key sections with headings covering the most "
-            "important points\n"
-            "   - A brief conclusion\n"
-            "   - A final 'Sources' section listing the URLs you actually "
-            "used\n"
+            "1. Use the DuckDuckGo Search tool ONCE with a focused query "
+            "(twice only if the first search genuinely isn't enough).\n"
+            "2. Write a short Markdown report with:\n"
+            "   - A 1-2 sentence introduction\n"
+            "   - 2-3 short sections with headings\n"
+            "   - A 1-2 sentence conclusion\n"
+            "   - A 'Sources' section listing the URLs you used\n"
         ),
         expected_output=(
-            "A well-structured Markdown report, roughly 300-500 words, "
-            "with headings, a conclusion, and a 'Sources' section listing "
-            "real URLs returned by the search tool."
+            "A concise Markdown report (250-400 words) with headings, a "
+            "short conclusion, and a 'Sources' section with real URLs."
         ),
         agent=researcher,
     )
@@ -128,29 +120,32 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "rate_limit_exceeded" in msg or "Rate limit reached" in msg
 
 
-def _extract_retry_seconds(exc: Exception, default: float = 15.0) -> float:
+def _extract_retry_seconds(exc: Exception, default: float = 20.0) -> float:
     """Groq tells us exactly how long to wait, e.g. '...in 10.4175s.'."""
     match = re.search(r"try again in ([\d.]+)s", str(exc))
     if match:
         try:
-            return float(match.group(1)) + 2.0  # small safety buffer
+            return float(match.group(1)) + 5.0  # extra safety buffer
         except ValueError:
             pass
     return default
 
 
-def run_research(topic: str, groq_api_key: str, max_retries: int = 3) -> str:
+def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
     """
     Run the crew for a topic and return the final report as a string.
 
     Groq's free tier limits how many tokens per minute you can use. If we
-    hit that limit mid-run, wait for the time Groq tells us and retry
-    automatically instead of failing the whole report.
+    hit that limit, wait for the time Groq tells us (plus a buffer) and
+    retry automatically instead of failing the whole report. Each retry
+    reruns the crew from scratch, so this is a safety net for occasional
+    spikes - it isn't a substitute for keeping each run's token usage low,
+    which is what the smaller prompts/results above are for.
     """
-    crew = build_crew(topic, groq_api_key)
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
+        crew = build_crew(topic, groq_api_key)
         try:
             result = crew.kickoff()
             return str(result)
