@@ -4,6 +4,9 @@ free DuckDuckGo search and writes the findings up with Groq's
 openai/gpt-oss-120b model.
 """
 
+import re
+import time
+
 import litellm
 
 from crewai import Agent, Task, Crew, Process, LLM
@@ -63,6 +66,7 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
         model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
         temperature=0.5,
+        max_tokens=1200,  # keeps completions smaller, easier on free-tier TPM limits
     )
 
     researcher = Agent(
@@ -116,8 +120,42 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
     )
 
 
-def run_research(topic: str, groq_api_key: str) -> str:
-    """Run the crew for a topic and return the final report as a string."""
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return "rate_limit_exceeded" in msg or "Rate limit reached" in msg
+
+
+def _extract_retry_seconds(exc: Exception, default: float = 15.0) -> float:
+    """Groq tells us exactly how long to wait, e.g. '...in 10.4175s.'."""
+    match = re.search(r"try again in ([\d.]+)s", str(exc))
+    if match:
+        try:
+            return float(match.group(1)) + 2.0  # small safety buffer
+        except ValueError:
+            pass
+    return default
+
+
+def run_research(topic: str, groq_api_key: str, max_retries: int = 3) -> str:
+    """
+    Run the crew for a topic and return the final report as a string.
+
+    Groq's free tier limits how many tokens per minute you can use. If we
+    hit that limit mid-run, wait for the time Groq tells us and retry
+    automatically instead of failing the whole report.
+    """
     crew = build_crew(topic, groq_api_key)
-    result = crew.kickoff()
-    return str(result)
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = crew.kickoff()
+            return str(result)
+        except Exception as exc:
+            if _is_rate_limit_error(exc) and attempt < max_retries:
+                last_error = exc
+                time.sleep(_extract_retry_seconds(exc))
+                continue
+            raise
+
+    raise last_error  # pragma: no cover - unreachable in practice
