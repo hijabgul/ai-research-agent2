@@ -2,5 +2,6 @@ streamlit
 crewai
 crewai-tools
 litellm
-duckduckgo-search
-groq
+ddgs
+markdown
+weasyprint
