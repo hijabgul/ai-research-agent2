@@ -3,12 +3,9 @@ Builds and runs a single-agent CrewAI "crew" that researches a topic using
 free DuckDuckGo search and writes the findings up with Groq's
 openai/gpt-oss-120b model.
 
-Tuned to stay well under Groq's free-tier 8,000 tokens/minute cap:
-- short backstory/task text (every word costs tokens on every call)
-- small search results (2 results, short snippets)
-- capped completion length
-- capped agent loop iterations (fewer LLM round-trips per run)
-- automatic retry with backoff if the rate limit is still hit
+Tuned to produce a COMPLETE research report (with Good Effects table,
+Bad Effects table, and a detailed research section) while staying within
+Groq's free-tier 8,000 tokens/minute cap.
 """
 
 import re
@@ -68,25 +65,30 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
     """Create the single-agent crew for a given research topic."""
 
     # openai/gpt-oss-120b is capped at 8,000 tokens/minute on Groq's free
-    # tier. Every current free-tier Groq chat model shares roughly that
-    # same cap, so the fix is to keep each run's token usage small rather
-    # than pick a roomier model.
+    # tier. That cap is a RATE limit (per minute), not a per-call output
+    # cap -- so a single, larger completion is fine as long as we don't
+    # spam the API in a tight loop. We give each completion enough room
+    # to finish the full report, and we keep the agent loop short so we
+    # don't blow the per-minute budget.
     llm = LLM(
         model="groq/openai/gpt-oss-120b",
         api_key=groq_api_key,
         temperature=0.5,
-        max_tokens=600,  # caps how long each completion can be
+        max_tokens=4000,  # <-- raised from 600: allows a FULL report
     )
 
     researcher = Agent(
         role="Research Analyst",
-        goal=f"Research '{topic}' and write a short, factual report.",
-        backstory="Concise research analyst. Search first, write briefly, never invent sources.",
+        goal=f"Research '{topic}' and write a complete, detailed report.",
+        backstory=(
+            "Thorough research analyst. Search first, cite real sources, "
+            "never invent facts. Always produce every section requested."
+        ),
         tools=[duckduckgo_search],
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        max_iter=4,  # caps how many think/act loops the agent can take
+        max_iter=6,  # <-- raised from 4: gives room to search + write
     )
 
     research_task = Task(
@@ -94,15 +96,35 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
             f"Research the topic: '{topic}'.\n\n"
             "1. Use the DuckDuckGo Search tool ONCE with a focused query "
             "(twice only if the first search genuinely isn't enough).\n"
-            "2. Write a short Markdown report with:\n"
-            "   - A 1-2 sentence introduction\n"
-            "   - 2-3 short sections with headings\n"
-            "   - A 1-2 sentence conclusion\n"
-            "   - A 'Sources' section listing the URLs you used\n"
+            "2. Write a COMPLETE Markdown research report. You MUST include "
+            "ALL of the following sections in this exact order, and you "
+            "must NOT stop early:\n\n"
+            f"# Research Report: {topic}\n\n"
+            "## 1. Introduction\n"
+            "   - 2 paragraphs explaining the topic and why it matters.\n\n"
+            "## 2. Good Effects\n"
+            "   - A Markdown table with these exact columns:\n"
+            "     | Effect | Description | Real-world Example |\n"
+            "   - Provide AT LEAST 5 rows.\n\n"
+            "## 3. Bad Effects\n"
+            "   - A Markdown table with these exact columns:\n"
+            "     | Effect | Description | Real-world Example |\n"
+            "   - Provide AT LEAST 5 rows.\n\n"
+            "## 4. Detailed Research Report\n"
+            "   - 600-900 words covering: Background, Current Applications, "
+            "Challenges and Limitations, Future Outlook.\n\n"
+            "## 5. Conclusion\n"
+            "   - 1-2 paragraphs summarizing the findings.\n\n"
+            "## 6. Sources\n"
+            "   - A bullet list of the real URLs you used.\n\n"
+            "Do NOT stop before finishing ALL 6 sections. The tables in "
+            "sections 2 and 3 are mandatory."
         ),
         expected_output=(
-            "A concise Markdown report (250-400 words) with headings, a "
-            "short conclusion, and a 'Sources' section with real URLs."
+            "A full Markdown research report containing: an Introduction, "
+            "a Good Effects table (min 5 rows), a Bad Effects table "
+            "(min 5 rows), a 600-900 word Detailed Research section, a "
+            "Conclusion, and a Sources section with real URLs."
         ),
         agent=researcher,
     )
@@ -137,10 +159,7 @@ def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
 
     Groq's free tier limits how many tokens per minute you can use. If we
     hit that limit, wait for the time Groq tells us (plus a buffer) and
-    retry automatically instead of failing the whole report. Each retry
-    reruns the crew from scratch, so this is a safety net for occasional
-    spikes - it isn't a substitute for keeping each run's token usage low,
-    which is what the smaller prompts/results above are for.
+    retry automatically instead of failing the whole report.
     """
     last_error: Exception | None = None
 
