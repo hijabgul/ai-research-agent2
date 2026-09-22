@@ -1,7 +1,15 @@
 """
 Research agent that produces a COMPLETE, topic-adaptive report.
-Uses direct Groq calls only -- no CrewAI for generation, which avoids
-the "Tool choice is none" bug entirely while staying within token limits.
+
+Architecture:
+  Phase 1: Search the web directly via ddgs (no CrewAI -> no tool-call bug).
+  Phase 2: Direct Groq calls write the report in 4 small, adaptive chunks.
+
+Why no CrewAI?
+CrewAI + Groq's gpt-oss-120b has a known bug where tool calls fail with
+"Tool choice is none, but model called a tool". By skipping CrewAI
+entirely for this flow, we sidestep the bug completely while still
+staying well under Groq's free-tier 8,000 tokens/minute cap.
 """
 
 import re
@@ -30,7 +38,6 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
             return resp.choices[0].message.content or ""
         except Exception as exc:
             msg = str(exc)
-            # Retry only on rate limits, not on tool-choice errors
             if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < 3:
                 m = re.search(r"try again in ([\d.]+)s", msg)
                 wait = (float(m.group(1)) + 5.0) if m else 20.0
@@ -41,33 +48,65 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Search the web (no CrewAI, so no tool-calling bug)
+# Phase 1: Search the web (via ddgs, with model-knowledge fallback)
 # ---------------------------------------------------------------------------
 def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """Search the web directly and distill into facts."""
-    from tools.duckduckgo_tool import duckduckgo_search
+    """
+    Gather facts. Try ddgs search first; on failure, ask the model directly.
+    Never returns empty -- guarantees tables and sources get populated.
+    """
+    raw = ""
+    try:
+        from ddgs import DDGS
 
-    # Call the tool directly -- no CrewAI agent involved
-    results = duckduckgo_search.run(f"{topic} overview facts")
+        with DDGS() as ddgs:
+            results = list(ddgs.text(f"{topic} facts", max_results=6))
 
-    # Distill into bullet facts using a plain Groq call
+        raw = "\n".join(
+            f"- {r.get('title', '')}: {r.get('body', '')} [{r.get('href', '')}]"
+            for r in results
+            if r.get("body")
+        )
+    except Exception as exc:
+        raw = f"SEARCH_FAILED: {exc}"
+
+    if not raw or "SEARCH_FAILED" in raw or len(raw.strip()) < 100:
+        # Fallback: model knowledge, clearly labelled.
+        return _groq_call(
+            groq_api_key,
+            "You are a knowledge extractor. Output only bullet facts.",
+            f"""
+Web search for "{topic}" failed. Use your own knowledge.
+
+Produce 12-15 bullet facts about "{topic}". Each bullet:
+- <fact>
+
+At the end add this exact line:
+SOURCES: (model knowledge -- web search unavailable)
+""",
+            max_tokens=800,
+        )
+
+    # We got search results -- distill into bullets.
     return _groq_call(
         groq_api_key,
-        "You extract facts from search results. Return only bullet points with URLs.",
+        "You extract facts from search results. Return only bullet points.",
         f"""
 Search results for "{topic}":
-{results}
+{raw[:3000]}
 
-Extract 10-15 key facts as bullet points. Include source URLs in brackets.
+Extract 12-15 key facts as bullets. Include any URLs you see in brackets.
 Format: - fact one [url]
-Do NOT write paragraphs. Do NOT call tools.
+
+At the end add a line:
+SOURCES: <comma-separated URLs found>
 """,
         max_tokens=800,
     )
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Write the report (no tools, so no tool-choice error)
+# Phase 2: Write the report (no tools, no tool-choice error)
 # ---------------------------------------------------------------------------
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
     """Write the report in 4 small, adaptive, non-truncating calls."""
@@ -78,7 +117,7 @@ def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
         "Never stop early. Do NOT call any tools."
     )
 
-    # Call 0: Decide report structure
+    # ---- Call 0: Decide report structure for THIS topic -----------------
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
@@ -115,7 +154,7 @@ BODY_FOCUS: <one line describing what the detailed section should cover>
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
-    # Call 1: Introduction + Detailed body
+    # ---- Call 1: Introduction + Detailed body ---------------------------
     body = _groq_call(
         groq_api_key,
         system,
@@ -135,10 +174,10 @@ Write ONLY these two sections in Markdown, no tables:
 
 Output ONLY these two sections. Do NOT call tools.
 """,
-        max_tokens=2000,
+        max_tokens=1500,
     )
 
-    # Call 2: The two adaptive tables
+    # ---- Call 2: The two adaptive tables --------------------------------
     tables = _groq_call(
         groq_api_key,
         system,
@@ -169,10 +208,10 @@ no intro, no headings besides the ones shown).
 
 Do NOT call tools.
 """,
-        max_tokens=1500,
+        max_tokens=1200,
     )
 
-    # Call 3: Conclusion + Sources
+    # ---- Call 3: Conclusion + Sources -----------------------------------
     ending = _groq_call(
         groq_api_key,
         system,
@@ -188,11 +227,11 @@ Write ONLY these two sections:
 (1-2 paragraphs.)
 
 ## 6. Sources
-(A bullet list of the URLs from the facts above.)
-
+If real URLs appear in the facts above, list them as bullets.
+If NOT, write exactly: "Model knowledge -- live web sources unavailable."
 Do NOT call tools.
 """,
-        max_tokens=800,
+        max_tokens=700,
     )
 
     return (
@@ -217,7 +256,10 @@ def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
             return report
         except Exception as exc:
             msg = str(exc)
-            if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < max_retries:
+            if (
+                ("rate_limit_exceeded" in msg or "Rate limit" in msg)
+                and attempt < max_retries
+            ):
                 last_error = exc
                 m = re.search(r"try again in ([\d.]+)s", msg)
                 wait = (float(m.group(1)) + 5.0) if m else 20.0
