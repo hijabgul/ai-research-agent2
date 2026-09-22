@@ -1,6 +1,5 @@
 """
 Streamlit UI for the AI Research Agent.
-
 Renders the report as styled HTML and offers a PDF download.
 PDF is generated with fpdf2 (pure Python, no system libs required).
 """
@@ -27,7 +26,7 @@ def _build_pdf(markdown_text: str) -> bytes:
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    USABLE_WIDTH = pdf.epw - 10   # effective page width minus padding
+    USABLE_WIDTH = pdf.epw - 10
 
     def _safe(text: str) -> str:
         text = (
