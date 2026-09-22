@@ -102,7 +102,7 @@ with st.sidebar:
     st.markdown("### About")
     st.markdown(
         "This app uses a single research pipeline that:\n\n"
-        "1. Searches the web with DuckDuckGo\n"
+        "1. Searches the web with DuckDuckGo + Wikipedia\n"
         "2. Writes a structured, topic-adaptive report using Groq's "
         "`openai/gpt-oss-120b`"
     )
@@ -113,7 +113,7 @@ with st.sidebar:
 # Main UI
 # ---------------------------------------------------------------------------
 st.title("🔍 AI Research Agent")
-st.caption("Groq `openai/gpt-oss-120b` + free DuckDuckGo search")
+st.caption("Groq `openai/gpt-oss-120b` + DuckDuckGo + Wikipedia")
 
 topic = st.text_input("Enter a research topic", placeholder="e.g. The role of NLP")
 
