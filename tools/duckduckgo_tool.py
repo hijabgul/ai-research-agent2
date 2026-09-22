@@ -1,161 +1,50 @@
 """
-Builds and runs a single-agent CrewAI "crew" that researches a topic using
-free DuckDuckGo search and writes the findings up with Groq's
-openai/gpt-oss-120b model.
+A free web search tool for our CrewAI agent, built on top of the `ddgs`
+package (the renamed/maintained successor of `duckduckgo-search`).
+
+No API key is required for this tool — that's what makes it beginner
+friendly and free to run.
 """
 
-import re
-import time
-
-import litellm
-
-from crewai import Agent, Task, Crew, Process, LLM
-
-from tools.duckduckgo_tool import duckduckgo_search
+from crewai.tools import tool
+from ddgs import DDGS
 
 
-def _patch_litellm_strip_cache_breakpoint() -> None:
+@tool("DuckDuckGo Search")
+def duckduckgo_search(query: str) -> str:
     """
-    Work around a current CrewAI bug: CrewAI tags messages internally with
-    a `cache_breakpoint` marker to support prompt caching. That marker is
-    supposed to be stripped before the request reaches non-native
-    providers, but for models routed through LiteLLM (which includes Groq)
-    that stripping step is currently missing, so Groq rejects the request
-    with "property 'cache_breakpoint' is unsupported".
+    Search the web using DuckDuckGo and return the top results.
 
-    Tracking issue: https://github.com/crewAIInc/crewAI/issues/6789
-    (fix written, not yet released as of this writing)
+    Use this whenever you need current, factual information about a topic —
+    for example, recent news, statistics, definitions, or general
+    background. Call it several times with different, specific queries to
+    build up a well-rounded picture of the topic before writing anything.
 
-    This patches litellm to strip the marker ourselves until CrewAI ships
-    an official fix. Safe to remove once that fix is released.
+    Args:
+        query: A short, specific search query (a few words works best,
+            e.g. "solid-state battery 2026 breakthroughs").
+
+    Returns:
+        A numbered list of results, each with a title, URL, and short
+        snippet, or a message saying no results were found.
     """
-    if getattr(litellm, "_cache_breakpoint_patch_applied", False):
-        return
+    # Kept small on purpose: Groq's free tier has a strict tokens-per-minute
+    # limit, and every character returned here becomes tokens the LLM has
+    # to read. 3 results with short snippets is usually enough context.
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=3))
+    except Exception as exc:  # network hiccups, rate limits, etc.
+        return f"Search failed for query '{query}': {exc}"
 
-    def _clean(messages):
-        for m in messages or []:
-            if isinstance(m, dict):
-                m.pop("cache_breakpoint", None)
-        return messages
+    if not results:
+        return f"No results found for query: '{query}'"
 
-    _original_completion = litellm.completion
-    _original_acompletion = litellm.acompletion
+    formatted = []
+    for i, r in enumerate(results, start=1):
+        title = r.get("title", "No title")
+        link = r.get("href", "No link")
+        snippet = (r.get("body", "") or "")[:220]  # truncate long snippets
+        formatted.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
 
-    def _patched_completion(*args, **kwargs):
-        _clean(kwargs.get("messages"))
-        return _original_completion(*args, **kwargs)
-
-    async def _patched_acompletion(*args, **kwargs):
-        _clean(kwargs.get("messages"))
-        return await _original_acompletion(*args, **kwargs)
-
-    litellm.completion = _patched_completion
-    litellm.acompletion = _patched_acompletion
-    litellm._cache_breakpoint_patch_applied = True
-
-
-_patch_litellm_strip_cache_breakpoint()
-
-
-def build_crew(topic: str, groq_api_key: str) -> Crew:
-    """Create the single-agent crew for a given research topic."""
-
-    # CrewAI routes non-native providers (like Groq) through LiteLLM.
-    # The model string format is "groq/<model-name>".
-    llm = LLM(
-        model="groq/openai/gpt-oss-120b",
-        api_key=groq_api_key,
-        temperature=0.5,
-        max_tokens=1200,  # keeps completions smaller, easier on free-tier TPM limits
-    )
-
-    researcher = Agent(
-        role="Senior Research Analyst",
-        goal=(
-            f"Research the topic '{topic}' thoroughly using web search, and "
-            "produce a clear, well-organized, factual report."
-        ),
-        backstory=(
-            "You are an experienced research analyst who is excellent at "
-            "turning raw web search results into clear, well-structured "
-            "reports. You always search before writing, cross-check facts "
-            "across multiple results, and never make up sources."
-        ),
-        tools=[duckduckgo_search],
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-    )
-
-    research_task = Task(
-        description=(
-            f"Research the topic: '{topic}'.\n\n"
-            "Steps to follow:\n"
-            "1. Use the DuckDuckGo Search tool at least 2-3 times with "
-            "different, specific search queries to gather up-to-date "
-            "information on the topic.\n"
-            "2. Cross-check facts that appear across multiple results.\n"
-            "3. Write a clear, well-organized report in Markdown format "
-            "with:\n"
-            "   - A short introduction to the topic\n"
-            "   - 3-5 key sections with headings covering the most "
-            "important points\n"
-            "   - A brief conclusion\n"
-            "   - A final 'Sources' section listing the URLs you actually "
-            "used\n"
-        ),
-        expected_output=(
-            "A well-structured Markdown report, roughly 400-700 words, "
-            "with headings, a conclusion, and a 'Sources' section listing "
-            "real URLs returned by the search tool."
-        ),
-        agent=researcher,
-    )
-
-    return Crew(
-        agents=[researcher],
-        tasks=[research_task],
-        process=Process.sequential,
-        verbose=True,
-    )
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    msg = str(exc)
-    return "rate_limit_exceeded" in msg or "Rate limit reached" in msg
-
-
-def _extract_retry_seconds(exc: Exception, default: float = 15.0) -> float:
-    """Groq tells us exactly how long to wait, e.g. '...in 10.4175s.'."""
-    match = re.search(r"try again in ([\d.]+)s", str(exc))
-    if match:
-        try:
-            return float(match.group(1)) + 2.0  # small safety buffer
-        except ValueError:
-            pass
-    return default
-
-
-def run_research(topic: str, groq_api_key: str, max_retries: int = 3) -> str:
-    """
-    Run the crew for a topic and return the final report as a string.
-
-    Groq's free tier limits how many tokens per minute you can use. If we
-    hit that limit mid-run, wait for the time Groq tells us and retry
-    automatically instead of failing the whole report.
-    """
-    crew = build_crew(topic, groq_api_key)
-    last_error: Exception | None = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            result = crew.kickoff()
-            return str(result)
-        except Exception as exc:
-            if _is_rate_limit_error(exc) and attempt < max_retries:
-                last_error = exc
-                time.sleep(_extract_retry_seconds(exc))
-                continue
-            raise
-
-    raise last_error  # pragma: no cover - unreachable in practice
+    return "\n\n".join(formatted)
