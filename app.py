@@ -1,9 +1,9 @@
 """
 Streamlit UI for the AI Research Agent.
 Renders the report as styled HTML and offers a PDF download.
-PDF is generated with fpdf2 (pure Python, no system libs required).
 """
 
+import concurrent.futures
 import os
 
 import markdown as md
@@ -36,7 +36,8 @@ def _build_pdf(markdown_text: str) -> bytes:
         out = []
         for w in text.split(" "):
             while len(w) > 60:
-                out.append(w[:60]); w = w[60:]
+                out.append(w[:60])
+                w = w[60:]
             out.append(w)
         return " ".join(out)
 
@@ -92,16 +93,30 @@ if st.button("Generate Report", type="primary"):
     if not topic.strip():
         st.warning("Please enter a topic first.")
         st.stop()
+
     try:
         groq_api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
         groq_api_key = os.environ.get("GROQ_API_KEY", "")
+
     if not groq_api_key:
         st.error("GROQ_API_KEY not found in secrets or environment.")
         st.stop()
+
     with st.spinner("Researching and writing the report..."):
         try:
-            report_md = run_research(topic, groq_api_key)
+            # Wrap the whole research call in a hard 180-second timeout
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(run_research, topic, groq_api_key)
+                try:
+                    report_md = fut.result(timeout=180)
+                except concurrent.futures.TimeoutError:
+                    st.error(
+                        "The research took too long (over 3 minutes). "
+                        "This usually means DuckDuckGo or Groq is slow right now. "
+                        "Try again with a simpler topic, or retry in a minute."
+                    )
+                    st.stop()
             st.session_state["report_md"] = report_md
             st.session_state["report_topic"] = topic
         except Exception as exc:
