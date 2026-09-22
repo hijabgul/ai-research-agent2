@@ -1,15 +1,7 @@
 """
 Research agent that produces a COMPLETE, topic-adaptive report.
-
-Architecture:
-  Phase 1: CrewAI agent searches the web and returns raw facts.
-  Phase 2: Direct Groq calls (no tools) write the report in 4 small chunks.
-  Phase 3: Report structure adapts to the topic (no forced Good/Bad tables).
-
-Why the split?
-CrewAI + Groq's gpt-oss-120b has a known bug where tool calls fail with
-"Tool choice is none, but model called a tool". By keeping tool-use
-confined to the search phase, we bypass the bug entirely.
+Uses direct Groq calls only -- no CrewAI for generation, which avoids
+the "Tool choice is none" bug entirely while staying within token limits.
 """
 
 import re
@@ -17,88 +9,12 @@ import time
 
 import litellm
 
-from crewai import Agent, Task, Crew, Process, LLM
 
-from tools.duckduckgo_tool import duckduckgo_search
-
-
-def _patch_litellm_strip_cache_breakpoint() -> None:
-    """Work around the CrewAI `cache_breakpoint` bug with LiteLLM/Groq."""
-    if getattr(litellm, "_cache_breakpoint_patch_applied", False):
-        return
-
-    def _clean(messages):
-        for m in messages or []:
-            if isinstance(m, dict):
-                m.pop("cache_breakpoint", None)
-        return messages
-
-    _original_completion = litellm.completion
-    _original_acompletion = litellm.acompletion
-
-    def _patched_completion(*args, **kwargs):
-        _clean(kwargs.get("messages"))
-        return _original_completion(*args, **kwargs)
-
-    async def _patched_acompletion(*args, **kwargs):
-        _clean(kwargs.get("messages"))
-        return await _original_acompletion(*args, **kwargs)
-
-    litellm.completion = _patched_completion
-    litellm.acompletion = _patched_acompletion
-    litellm._cache_breakpoint_patch_applied = True
-
-
-_patch_litellm_strip_cache_breakpoint()
-
-
-def _gather_facts(topic: str, groq_api_key: str) -> str:
-    """Phase 1: CrewAI agent searches the web and returns raw facts."""
-    llm = LLM(
-        model="groq/openai/gpt-oss-120b",
-        api_key=groq_api_key,
-        temperature=0.3,
-        max_tokens=800,
-    )
-
-    researcher = Agent(
-        role="Research Analyst",
-        goal=f"Search the web for facts about '{topic}'.",
-        backstory="Concise research analyst. Search first, return bullet facts with URLs.",
-        tools=[duckduckgo_search],
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=5,
-    )
-
-    task = Task(
-        description=(
-            f"Use the DuckDuckGo Search tool to research: '{topic}'.\n\n"
-            "Return ONLY a compact bullet list of facts and source URLs. "
-            "Do NOT write a report. Do NOT write paragraphs. "
-            "Format:\n"
-            "- fact one [url]\n"
-            "- fact two [url]\n"
-            "- fact three [url]\n"
-            "...\n"
-            "10-15 bullets maximum."
-        ),
-        expected_output="A short bullet list of facts with URLs. No prose.",
-        agent=researcher,
-    )
-
-    crew = Crew(
-        agents=[researcher],
-        tasks=[task],
-        process=Process.sequential,
-        verbose=True,
-    )
-    return str(crew.kickoff())
-
-
+# ---------------------------------------------------------------------------
+# Groq call helper with retry
+# ---------------------------------------------------------------------------
 def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
-    """Single Groq call via litellm — no tools, no CrewAI loop."""
+    """Single Groq call via litellm -- no tools, no CrewAI loop."""
     for attempt in range(4):
         try:
             resp = litellm.completion(
@@ -114,6 +30,7 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
             return resp.choices[0].message.content or ""
         except Exception as exc:
             msg = str(exc)
+            # Retry only on rate limits, not on tool-choice errors
             if ("rate_limit_exceeded" in msg or "Rate limit" in msg) and attempt < 3:
                 m = re.search(r"try again in ([\d.]+)s", msg)
                 wait = (float(m.group(1)) + 5.0) if m else 20.0
@@ -123,16 +40,45 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: Search the web (no CrewAI, so no tool-calling bug)
+# ---------------------------------------------------------------------------
+def _gather_facts(topic: str, groq_api_key: str) -> str:
+    """Search the web directly and distill into facts."""
+    from tools.duckduckgo_tool import duckduckgo_search
+
+    # Call the tool directly -- no CrewAI agent involved
+    results = duckduckgo_search.run(f"{topic} overview facts")
+
+    # Distill into bullet facts using a plain Groq call
+    return _groq_call(
+        groq_api_key,
+        "You extract facts from search results. Return only bullet points with URLs.",
+        f"""
+Search results for "{topic}":
+{results}
+
+Extract 10-15 key facts as bullet points. Include source URLs in brackets.
+Format: - fact one [url]
+Do NOT write paragraphs. Do NOT call tools.
+""",
+        max_tokens=800,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Write the report (no tools, so no tool-choice error)
+# ---------------------------------------------------------------------------
 def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
-    """Phase 2: Write the report in 4 small, adaptive, non-truncating calls."""
+    """Write the report in 4 small, adaptive, non-truncating calls."""
 
     system = (
         "You are a thorough research report writer. Use the provided facts. "
         "Never invent sources. Always produce every requested section fully. "
-        "Never stop early."
+        "Never stop early. Do NOT call any tools."
     )
 
-    # ---- Call 0: Decide the report structure for THIS topic -------------
+    # Call 0: Decide report structure
     plan = _groq_call(
         groq_api_key,
         "You design report outlines. Output only the requested lines.",
@@ -140,15 +86,14 @@ def _write_report(topic: str, facts: str, groq_api_key: str) -> str:
 Topic: "{topic}"
 
 Decide the BEST structure for a research report on this topic.
-Then pick TWO table sections that genuinely fit the topic -- do NOT
-force "Good Effects" / "Bad Effects" if they don't make sense.
+Pick TWO table sections that genuinely fit -- do NOT force
+"Good Effects" / "Bad Effects" if they don't make sense.
 
-Examples of good table choices:
+Examples:
 - Pros/cons topic -> "Good Effects" and "Bad Effects"
 - Historical topic -> "Timeline of Key Events" and "Key Figures / Leaders"
 - Comparison topic -> "Feature Comparison" and "Pros and Cons"
 - Person/org topic -> "Key Facts" and "Achievements and Controversies"
-- Scientific topic -> "Benefits" and "Risks and Limitations"
 
 Output EXACTLY these 5 lines, nothing else:
 TABLE1_HEADING: <short heading>
@@ -170,7 +115,7 @@ BODY_FOCUS: <one line describing what the detailed section should cover>
     t2_cols = _grab("TABLE2_COLUMNS", "Item | Description | Example")
     body_focus = _grab("BODY_FOCUS", f"an in-depth discussion of {topic}")
 
-    # ---- Call 1: Introduction + Detailed body ---------------------------
+    # Call 1: Introduction + Detailed body
     body = _groq_call(
         groq_api_key,
         system,
@@ -188,12 +133,12 @@ Write ONLY these two sections in Markdown, no tables:
 ## 4. Detailed Research Report
 (600-900 words focused on: {body_focus}. Use subsections.)
 
-Output ONLY these two sections.
+Output ONLY these two sections. Do NOT call tools.
 """,
         max_tokens=2000,
     )
 
-    # ---- Call 2: The two adaptive tables --------------------------------
+    # Call 2: The two adaptive tables
     tables = _groq_call(
         groq_api_key,
         system,
@@ -221,11 +166,13 @@ no intro, no headings besides the ones shown).
 | ... |
 
 (at least 6 rows)
+
+Do NOT call tools.
 """,
         max_tokens=1500,
     )
 
-    # ---- Call 3: Conclusion + Sources -----------------------------------
+    # Call 3: Conclusion + Sources
     ending = _groq_call(
         groq_api_key,
         system,
@@ -242,6 +189,8 @@ Write ONLY these two sections:
 
 ## 6. Sources
 (A bullet list of the URLs from the facts above.)
+
+Do NOT call tools.
 """,
         max_tokens=800,
     )
@@ -254,6 +203,9 @@ Write ONLY these two sections:
     )
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 def run_research(topic: str, groq_api_key: str, max_retries: int = 4) -> str:
     """Research a topic and return the COMPLETE report as a string."""
     last_error: Exception | None = None
