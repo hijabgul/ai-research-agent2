@@ -4,9 +4,54 @@ free DuckDuckGo search and writes the findings up with Groq's
 openai/gpt-oss-120b model.
 """
 
+import litellm
+
 from crewai import Agent, Task, Crew, Process, LLM
 
 from tools.duckduckgo_tool import duckduckgo_search
+
+
+def _patch_litellm_strip_cache_breakpoint() -> None:
+    """
+    Work around a current CrewAI bug: CrewAI tags messages internally with
+    a `cache_breakpoint` marker to support prompt caching. That marker is
+    supposed to be stripped before the request reaches non-native
+    providers, but for models routed through LiteLLM (which includes Groq)
+    that stripping step is currently missing, so Groq rejects the request
+    with "property 'cache_breakpoint' is unsupported".
+
+    Tracking issue: https://github.com/crewAIInc/crewAI/issues/6789
+    (fix written, not yet released as of this writing)
+
+    This patches litellm to strip the marker ourselves until CrewAI ships
+    an official fix. Safe to remove once that fix is released.
+    """
+    if getattr(litellm, "_cache_breakpoint_patch_applied", False):
+        return
+
+    def _clean(messages):
+        for m in messages or []:
+            if isinstance(m, dict):
+                m.pop("cache_breakpoint", None)
+        return messages
+
+    _original_completion = litellm.completion
+    _original_acompletion = litellm.acompletion
+
+    def _patched_completion(*args, **kwargs):
+        _clean(kwargs.get("messages"))
+        return _original_completion(*args, **kwargs)
+
+    async def _patched_acompletion(*args, **kwargs):
+        _clean(kwargs.get("messages"))
+        return await _original_acompletion(*args, **kwargs)
+
+    litellm.completion = _patched_completion
+    litellm.acompletion = _patched_acompletion
+    litellm._cache_breakpoint_patch_applied = True
+
+
+_patch_litellm_strip_cache_breakpoint()
 
 
 def build_crew(topic: str, groq_api_key: str) -> Crew:
