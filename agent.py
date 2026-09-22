@@ -3,6 +3,7 @@ Research agent that produces a COMPLETE, topic-adaptive report.
 
 Architecture:
   Phase 1: Search the web directly via ddgs (no CrewAI -> no tool-call bug).
+           Two searches: general + time-limited to past year (for recency).
   Phase 2: Direct Groq calls write the report in 4 small, adaptive chunks.
 """
 
@@ -40,22 +41,26 @@ def _groq_call(api_key: str, system: str, user: str, max_tokens: int) -> str:
 
 def _gather_facts(topic: str, groq_api_key: str) -> str:
     """
-    Gather facts. Search with a recency-weighted query so the model
-    gets CURRENT info, not its stale internal knowledge.
+    Gather facts. Two searches: general + time-limited to last year,
+    so we get CURRENT info and not stale Wikipedia text.
     """
     raw = ""
     try:
         from ddgs import DDGS
 
-        # Use a recency-friendly query. The word "latest" and "current"
-        # nudges ddgs to return fresh results.
-        query = f"{topic} latest current 2026"
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=8))
+            general = list(ddgs.text(topic, max_results=6))
+            try:
+                recent = list(
+                    ddgs.text(f"{topic} 2025 2026", max_results=5, timelimit="y")
+                )
+            except Exception:
+                recent = []
 
+        all_results = general + recent
         raw = "\n".join(
             f"- {r.get('title', '')}: {r.get('body', '')} [{r.get('href', '')}]"
-            for r in results
+            for r in all_results
             if r.get("body")
         )
     except Exception as exc:
@@ -71,9 +76,9 @@ Web search for "{topic}" failed. Use your own knowledge.
 Produce 12-15 bullet facts about "{topic}". Each bullet:
 - <fact>
 
-IMPORTANT: Your training data has a cutoff. If the topic involves
-people or events after 2023, say clearly that the information may
-be outdated.
+IMPORTANT: Your training data has a cutoff around 2023. If the topic
+involves people or events after 2023, say clearly that the information
+may be outdated.
 
 At the end add this exact line:
 SOURCES: (model knowledge -- web search unavailable)
@@ -81,24 +86,24 @@ SOURCES: (model knowledge -- web search unavailable)
             max_tokens=800,
         )
 
-    # Distill into bullets, explicitly telling the model to PREFER the
-    # search results over its own memory.
     return _groq_call(
         groq_api_key,
         "You extract facts from search results. Return only bullet points.",
         f"""
 Search results for "{topic}" (these are CURRENT, use them):
-{raw[:3500]}
+{raw[:4000]}
 
 Extract 12-15 key facts as bullets.
 
 CRITICAL RULES:
 1. PREFER the search results above over your own memory.
-2. If the search results contradict your training data, USE THE
-   SEARCH RESULTS -- they are more recent.
-3. Include any URLs you see in brackets.
-4. If the search results mention a specific date or office-holder,
-   include that exact detail.
+2. If a search result mentions a DATE in 2024, 2025, or 2026, include
+   that exact date and event -- these are the most important facts.
+3. If the search results contradict your training data, USE THE
+   SEARCH RESULTS.
+4. If the search results say nothing about 2024-2026, say so explicitly
+   in a bullet: "No 2024-2026 updates in search results."
+5. Include source URLs in brackets.
 
 Format: - fact one [url]
 
@@ -163,19 +168,24 @@ BODY_FOCUS: <one line describing what the detailed section should cover>
         f"""
 Topic: {topic}
 
-Facts gathered (current, use these):
+Facts gathered (CURRENT as of 2026 -- trust these over memory):
 {facts}
 
 Write ONLY these two sections in Markdown, no tables:
 
 ## 1. Introduction
-(2 paragraphs.)
+(2 paragraphs. In the FIRST paragraph, explicitly state who currently
+holds the relevant office / what is the current status as of 2026.
+If the facts do not say, write "As of 2026, current information is
+unavailable from the search." -- do NOT guess from memory.)
 
 ## 4. Detailed Research Report
 (600-900 words focused on: {body_focus}. Use subsections.)
 
-IMPORTANT: Where the facts mention recent people/events, use those.
-Do NOT revert to older information.
+CRITICAL: Your training data ends around 2023. Do NOT present
+2023-era information as if it were current. Where the facts and your
+memory disagree, USE THE FACTS. If the facts do not cover a recent
+event, say so -- do NOT fill the gap from memory.
 
 Output ONLY these two sections. Do NOT call tools.
 """,
