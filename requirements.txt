@@ -4,4 +4,4 @@ crewai-tools
 litellm
 ddgs
 markdown
-weasyprint
+fpdf2
