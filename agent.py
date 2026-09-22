@@ -62,8 +62,14 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
 
     # CrewAI routes non-native providers (like Groq) through LiteLLM.
     # The model string format is "groq/<model-name>".
+    # openai/gpt-oss-120b is capped at only 8,000 tokens/minute on Groq's
+    # free tier, which is too tight for a multi-step agent (search + reason
+    # + write, several times over). llama-4-scout gets 30,000 TPM free —
+    # much more headroom — while still being a strong, fast, tool-capable
+    # model. Swap the model string below if you upgrade to a paid Groq tier
+    # and want gpt-oss-120b's specific style instead.
     llm = LLM(
-        model="groq/openai/gpt-oss-120b",
+        model="groq/meta-llama/llama-4-scout-17b-16e-instruct",
         api_key=groq_api_key,
         temperature=0.5,
         max_tokens=1200,  # keeps completions smaller, easier on free-tier TPM limits
